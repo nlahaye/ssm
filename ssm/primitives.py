@@ -12,7 +12,7 @@ from ssm.cstats import _blocks_to_bands_lower, _blocks_to_bands_upper, \
                        _transpose_banded, vjp_cholesky_banded_lower, \
                        _vjp_solve_banded_A, _vjp_solveh_banded_A
 
-from ssm.messages import forward_pass, grad_hmm_normalizer
+from ssm.messages import forward_pass, grad_hmm_normalizer, ar_forward_pass
 from ssm.util import LOG_EPS, DIV_EPS
 
 to_c = lambda arr: np.copy(getval(arr), 'C') if not arr.flags['C_CONTIGUOUS'] else getval(arr)
@@ -28,6 +28,19 @@ def hmm_normalizer(pi0, Ps, ll):
     ll = to_c(ll)
 
     forward_pass(pi0, Ps, ll, alphas)
+    return logsumexp(alphas[-1])
+
+@primitive
+def arhmm_normalizer(pi0, Ps, ll):
+    T, K = ll.shape
+    alphas = np.zeros((T+1, K))
+
+    # Make sure everything is C contiguous
+    pi0 = to_c(pi0)
+    Ps = to_c(Ps)
+    ll = to_c(ll)
+
+    ar_forward_pass(pi0, Ps, ll, alphas)
     return logsumexp(alphas[-1])
 
 

@@ -626,6 +626,100 @@ class CategoricalObservations(Observations):
         """
         raise NotImplementedError
 
+
+class ARCategoricalObservations(Observations):
+
+    def __init__(self, K, D, M=0, C=2):
+        """
+        @param C:  number of classes in the categorical observations
+        """
+        super(ARCategoricalObservations, self).__init__(K, D, M)
+        self.C = C
+        self.logits = npr.randn(K, D, C, C)
+
+    @property
+    def params(self):
+        return self.logits
+
+    @params.setter
+    def params(self, value):
+        self.logits = value
+
+    def permute(self, perm):
+        self.logits = self.logits[perm]
+
+    def log_likelihoods(self, data, input, mask, tag):
+        mask = np.ones_like(data, dtype=bool) if mask is None else mask
+        return stats.arcategorical_logpdf(data[:, None, :], self.logits, mask=mask[:, None, :])
+
+    def sample_x(self, z, xhist, input=None, tag=None, with_noise=True):
+        if len(xhist) < 1:
+            xhist = [0]
+        else:
+            xhist = xhist.astype(int)[0]
+        ps = np.exp(self.logits - logsumexp(self.logits, axis=-1, keepdims=True))
+        return np.array([npr.choice(self.C, p=ps[z, d, xhist[-1]]) for d in range(self.D)])
+
+    def m_step(self, expectations, datas, inputs, masks, tags, **kwargs):
+        datas = np.array(datas)[:, :-1]
+
+        x = np.concatenate(datas)
+        weights = np.concatenate([Ez for Ez, _, _ in expectations])
+
+        for k in range(self.K):
+            # compute weighted histogram of the class assignments
+            xoh = one_hot(x, self.C) 
+
+            # Create a transition count matrix for dimension d under state k
+            transition_matrix = np.zeros((self.C, self.C))
+
+            # Iterate through all possible transitions in the data
+            for t in range(1, len(xoh)):  # start from 1 because we need t-1
+                transition_matrix[x[t-1], x[t]] += weights[t-1, k]
+
+            # Smoothing and normalization to prevent division by zero and to handle unobserved transitions
+            # print(transition_matrix)
+            transition_matrix += 1e-5
+            transition_matrix /= transition_matrix.sum(axis=-1, keepdims=True)
+
+            # Logarithm of transition probabilities
+            self.logits[k] = np.log(transition_matrix)[np.newaxis, :, :]
+    
+    @ensure_args_are_lists
+    def initialize(self, datas, inputs=None, masks=None, tags=None, init_method="random"):
+        Ts = [data.shape[0]-1 for data in datas]
+
+        # Get initial discrete states
+        if init_method.lower() == 'kmeans':
+            # KMeans clustering
+            from sklearn.cluster import KMeans
+            km = KMeans(self.K)
+            km.fit(np.vstack(datas))
+            zs = np.split(km.labels_, np.cumsum(Ts)[:-1])
+
+        elif init_method.lower() =='random':
+            # Random assignment
+            zs = [npr.choice(self.K, size=T) for T in Ts]
+
+        else:
+            raise Exception('Not an accepted initialization type: {}'.format(init_method))
+
+        # Make a one-hot encoding of z and treat it as HMM expectations
+        Ezs = [one_hot(z, self.K) for z in zs]
+        expectations = [(Ez, None, None) for Ez in Ezs]
+
+        # Set the variances all at once to use the setter
+        self.m_step(expectations, datas, inputs, masks, tags)
+
+    def smooth(self, expectations, data, input, tag):
+        """
+        Compute the mean observation under the posterior distribution
+        of latent discrete states.
+        """
+        raise NotImplementedError
+    
+
+
 class InputDrivenObservations(Observations):
 
     def __init__(self, K, D, M=0, C=2, prior_mean = 0, prior_sigma=1000):

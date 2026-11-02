@@ -595,6 +595,47 @@ def categorical_logpdf(data, logits, mask=None):
     return np.sum(lls * mask, axis=-1)                               # (...,)
 
 
+def arcategorical_logpdf(data, logits, mask=None):
+    """
+    Compute the log probability density of a categorical distribution.
+    This will broadcast as long as data and logits have the same
+    (or at least compatible) leading dimensions.
+
+    Parameters
+    ----------
+    data : array_like (..., D) int (0 <= data < C)
+        The points at which to evaluate the log density
+
+    lambdas : array_like (..., D, C, C)
+        The logits of the categorical distribution(s) with C classes
+
+    mask : array_like (..., D) bool
+        Optional mask indicating which entries in the data are observed
+
+    Returns
+    -------
+    lps : array_like (...,)
+        Log probabilities under the categorical distribution(s).
+    """
+    D = data.shape[-1]
+    C = logits.shape[-1]
+    assert data.dtype in (int, np.int8, np.int16, np.int32, np.int64)
+    assert np.all((data >= 0) & (data < C))
+    assert logits.shape[-3] == D
+
+    # Check mask
+    mask = mask if mask is not None else np.ones_like(data, dtype=bool)
+    assert mask.shape == data.shape
+
+    logits = logits - logsumexp(logits, axis=-1, keepdims=True)      # (..., D, C, C)
+    x = one_hot(data, C)                                             # (..., D, C)
+    transition_probs = np.einsum('...i,...ij->...j', x[:-1], logits)
+
+    lls = np.sum(x[1:] * transition_probs, axis=-1)
+    # lls = np.sum(x[:-1] * logits, axis=-1)                                # (..., D)
+    return np.sum(lls * mask[1:], axis=-1)                                  # (...,)
+
+
 def vonmises_logpdf(data, mus, kappas, mask=None):
     """
     Compute the log probability density of a von Mises distribution.

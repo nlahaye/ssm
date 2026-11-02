@@ -262,24 +262,28 @@ class InputDrivenTransitions(StickyTransitions):
         T, D = data.shape
         return np.zeros((T-1, D, D))
 
-class RecurrentTransitions(InputDrivenTransitions):
+class RecurrentTransitions(Transitions):
     """
     Generalization of the input driven HMM in which the observations serve as future inputs
     """
-    def __init__(self, K, D, M=0, alpha=1, kappa=0):
-        super(RecurrentTransitions, self).__init__(K, D, M, alpha=alpha, kappa=kappa)
+    def __init__(self, K, D, C=127, M=0):
+        super(RecurrentTransitions, self).__init__(K, D, M)
 
         # Parameters linking past observations to state distribution
-        self.Rs = np.zeros((K, D))
+        self.C = C
+        self.Rs = np.zeros((C, D, K))
+        Ps = .95 * np.eye(K) + .05 * npr.rand(K, K)
+        Ps /= Ps.sum(axis=1, keepdims=True)
+        self.log_Ps = np.log(Ps)
 
     @property
     def params(self):
-        return super(RecurrentTransitions, self).params + (self.Rs,)
+        return (self.log_Ps, self.Rs,)
 
     @params.setter
     def params(self, value):
-        self.Rs = value[-1]
-        super(RecurrentTransitions, self.__class__).params.fset(self, value[:-1])
+        self.log_Ps = value[0]
+        self.Rs = value[1]
 
     def permute(self, perm):
         """
@@ -293,27 +297,15 @@ class RecurrentTransitions(InputDrivenTransitions):
         # Previous state effect
         log_Ps = np.tile(self.log_Ps[None, :, :], (T-1, 1, 1))
         # Input effect
-        log_Ps = log_Ps + np.dot(input[1:], self.Ws.T)[:, None, :]
+        # log_Ps = log_Ps + np.dot(input[1:], self.Ws.T)[:, None, :]
         # Past observations effect
-        log_Ps = log_Ps + np.dot(data[:-1], self.Rs.T)[:, None, :]
+
+        xoh = one_hot(data[:-1], self.C)
+        log_Ps = log_Ps + np.dot(xoh[:, 0, :], self.Rs[:, 0, :])[:, None, :]
         return log_Ps - logsumexp(log_Ps, axis=2, keepdims=True)
 
     def m_step(self, expectations, datas, inputs, masks, tags, **kwargs):
         Transitions.m_step(self, expectations, datas, inputs, masks, tags, **kwargs)
-
-    def neg_hessian_expected_log_trans_prob(self, data, input, mask, tag, expected_joints):
-        # Return (T-1, D, D) array of blocks for the diagonal of the Hessian
-        T, D = data.shape
-        hess = np.zeros((T-1,D,D))
-        vtildes = np.exp(self.log_transition_matrices(data, input, mask, tag)) # normalized probabilities
-        Ez = np.sum(expected_joints, axis=2) # marginal over z from T=1 to T-1
-        for k in range(self.K):
-            vtilde = vtildes[:,k,:] # normalized probabilities given state k
-            Rv = vtilde @ self.Rs
-            hess += Ez[:,k][:,None,None] * \
-                    ( np.einsum('tn, ni, nj ->tij', -vtilde, self.Rs, self.Rs) \
-                    + np.einsum('ti, tj -> tij', Rv, Rv))
-        return -1 * hess
 
 class RecurrentOnlyTransitions(Transitions):
     """
@@ -321,7 +313,7 @@ class RecurrentOnlyTransitions(Transitions):
     next state.  Get rid of the transition matrix and replace it
     with a constant bias r.
     """
-    def __init__(self, K, D, M=0):
+    def __init__(self, K, D, M=0, C=0):
         super(RecurrentOnlyTransitions, self).__init__(K, D, M)
 
         # Parameters linking past observations to state distribution
@@ -364,6 +356,71 @@ class RecurrentOnlyTransitions(Transitions):
         hess = np.einsum('tn, ni, nj ->tij', -vtilde, self.Rs, self.Rs) \
                + np.einsum('ti, tj -> tij', Rv, Rv)
         return -1 * hess
+
+class MLPRecurrentTransitions(Transitions):
+    """
+    Generalization of the input driven HMM in which the observations serve as future inputs
+    """
+    def __init__(self, K, D, M=0, C=10):
+        super(MLPRecurrentTransitions, self).__init__(K, D, M)
+
+        # Parameters linking past observations to state distribution
+        self.C = C
+        # self.Rs = np.zeros((C, D, K))
+        hidden_size = 32
+        # hidden_size = 8
+        self.W1 = np.random.randn(C, hidden_size) * np.sqrt(2. / C)
+        self.b1 = np.zeros((1, hidden_size))
+        self.W2 = np.random.randn(hidden_size, K) * np.sqrt(2. / hidden_size)
+        self.b2 = np.zeros((1, K))
+        Ps = .95 * np.eye(K) + .05 * npr.rand(K, K)
+        Ps /= Ps.sum(axis=1, keepdims=True)
+        self.log_Ps = np.log(Ps)
+
+    @property
+    def params(self):
+        return (self.log_Ps, self.W1, self.b1, self.W2, self.b2)
+
+    @params.setter
+    def params(self, value):
+        self.log_Ps = value[0]
+        self.W1 = value[1]
+        self.b1 = value[2]
+        self.W2 = value[3]
+        self.b2 = value[4]
+
+
+    def permute(self, perm):
+        """
+        Permute the discrete latent states.
+        """
+        super(RecurrentTransitions, self).permute(perm)
+        self.Rs = self.Rs[perm]
+    
+    def sigmoid(self, x):
+        return 1 / (1 + np.exp(-x))
+
+    def log_transition_matrices(self, data, input, mask, tag):
+        T, _ = data.shape
+        # Previous state effect
+        log_Ps = np.tile(self.log_Ps[None, :, :], (T-1, 1, 1))
+        # Input effect
+        # log_Ps = log_Ps + np.dot(input[1:], self.Ws.T)[:, None, :]
+        # Past observations effect
+        # data2 = np.roll(data, 1, axis=0)  
+        xoh = one_hot(data[:-1], self.C)
+        
+        Z1 = np.dot(xoh[:, 0, :], self.W1) + self.b1
+        A1 = self.sigmoid(Z1)
+        Z2 = np.dot(A1, self.W2) + self.b2
+        # A2 = softmax(Z2)
+
+         
+        log_Ps = log_Ps + Z2[:, None, :]
+        return log_Ps - logsumexp(log_Ps, axis=2, keepdims=True)
+
+    def m_step(self, expectations, datas, inputs, masks, tags, **kwargs):
+        Transitions.m_step(self, expectations, datas, inputs, masks, tags, **kwargs)
 
 
 class RBFRecurrentTransitions(InputDrivenTransitions):
