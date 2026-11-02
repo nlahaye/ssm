@@ -392,10 +392,12 @@ class MLPRecurrentTransitions(Transitions):
 
     def permute(self, perm):
         """
-        Permute the discrete latent states.
+        Permute the discrete latent states (rows / columns of log_Ps and the output layer of the MLP).
+        (Previously called super(RecurrentTransitions, ...) and indexed a non-existent self.Rs.)
         """
-        super(RecurrentTransitions, self).permute(perm)
-        self.Rs = self.Rs[perm]
+        self.log_Ps = self.log_Ps[np.ix_(perm, perm)]
+        self.W2 = self.W2[:, perm]
+        self.b2 = self.b2[:, perm]
     
     def sigmoid(self, x):
         return 1 / (1 + np.exp(-x))
@@ -406,9 +408,9 @@ class MLPRecurrentTransitions(Transitions):
         log_Ps = np.tile(self.log_Ps[None, :, :], (T-1, 1, 1))
         # Input effect
         # log_Ps = log_Ps + np.dot(input[1:], self.Ws.T)[:, None, :]
-        # Past observations effect
-        # data2 = np.roll(data, 1, axis=0)  
-        xoh = one_hot(data[:-1], self.C)
+        # Past observations effect: column 0 is the discrete state (extra columns, e.g. the kinematics of
+        # ARCategoricalKinematicObservations, are ignored; identical to before for D = 1 data)
+        xoh = one_hot(data[:-1, :1], self.C)
         
         Z1 = np.dot(xoh[:, 0, :], self.W1) + self.b1
         A1 = self.sigmoid(Z1)
@@ -421,6 +423,52 @@ class MLPRecurrentTransitions(Transitions):
 
     def m_step(self, expectations, datas, inputs, masks, tags, **kwargs):
         Transitions.m_step(self, expectations, datas, inputs, masks, tags, **kwargs)
+
+
+class CoupledMLPRecurrentTransitions(MLPRecurrentTransitions):
+    """
+    Multi-agent (partner-coupled) version of MLPRecurrentTransitions:
+
+        P_t(j -> k) = (1 - alpha w_t) P^MLP_t(j -> k | x_t) + alpha w_t c_t[k]
+
+    input[t] = [w_t, c_t[0], ..., c_t[K-1]] (M = K + 1): w_t in [0, 1] partner availability and c_t the
+    partners' kernel-weighted intention posterior for the latent that emits data step t
+    (naturenet hiavi_multiagent.PartnerContext.context). Transition matrix t (z_t -> z_{t+1}) uses input[t+1]
+    in ssm's ARHMM indexing, where z_{t+1} emits the move x_t -> x_{t+1} (log-likelihood row t), i.e.
+    `inputs` rows are aligned with data rows. alpha = sigmoid(alpha_raw) is fitted with the other parameters
+    by the generic Transitions.m_step (autograd). alpha = 0 or w = 0 is exactly MLPRecurrentTransitions.
+    """
+    def __init__(self, K, D, M=0, C=10, alpha0=0.1, fit_alpha=True):
+        if M != K + 1:
+            raise ValueError("CoupledMLPRecurrentTransitions needs M = K + 1 inputs [w, c_0..c_{K-1}]; got M=%d, K=%d" % (M, K))
+        super(CoupledMLPRecurrentTransitions, self).__init__(K, D, M=M, C=C)
+        a = float(np.clip(alpha0, 1e-4, 1 - 1e-4))
+        self.alpha_raw = np.log(a / (1 - a))
+        self.fit_alpha = fit_alpha
+        self._alpha_fixed = float(alpha0)
+
+    @property
+    def alpha(self):
+        return 1. / (1. + np.exp(-self.alpha_raw)) if self.fit_alpha else self._alpha_fixed
+
+    @property
+    def params(self):
+        return (self.log_Ps, self.W1, self.b1, self.W2, self.b2, self.alpha_raw)
+
+    @params.setter
+    def params(self, value):
+        self.log_Ps, self.W1, self.b1, self.W2, self.b2 = value[:5]
+        if self.fit_alpha:
+            self.alpha_raw = value[5]
+
+    def log_transition_matrices(self, data, input, mask, tag):
+        log_P0 = super(CoupledMLPRecurrentTransitions, self).log_transition_matrices(data, input, mask, tag)
+        if input is None or input.shape[1] != self.K + 1:
+            return log_P0
+        aw = self.alpha * input[1:, 0][:, None, None]
+        c = input[1:, 1:][:, None, :]
+        P = (1 - aw) * np.exp(log_P0) + aw * c
+        return np.log(np.clip(P, 1e-300, 1.0))
 
 
 class RBFRecurrentTransitions(InputDrivenTransitions):

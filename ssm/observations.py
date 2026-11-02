@@ -2,6 +2,7 @@ import copy
 import warnings
 
 import autograd.numpy as np
+import numpy as onp
 import autograd.numpy.random as npr
 
 from autograd.scipy.special import gammaln, digamma, logsumexp
@@ -660,30 +661,46 @@ class ARCategoricalObservations(Observations):
         ps = np.exp(self.logits - logsumexp(self.logits, axis=-1, keepdims=True))
         return np.array([npr.choice(self.C, p=ps[z, d, xhist[-1]]) for d in range(self.D)])
 
-    def m_step(self, expectations, datas, inputs, masks, tags, **kwargs):
-        datas = np.array(datas)[:, :-1]
+    # True restores the original m_step: it concatenated all sequences (counting a spurious transition at
+    # every sequence boundary), dropped each sequence's last transition and weighted transition x_{t-1} -> x_t
+    # with P(z_{t-1}) instead of the posterior of the state that emits it (P(z_t) in ssm's ARHMM indexing).
+    legacy_mstep = False
 
+    @staticmethod
+    def emission_weights(Ez, Ezzp1, n):
+        """(n, K) posteriors of the latent emitting log-likelihood rows 0..n-1 (= moves x_t -> x_{t+1})."""
+        if Ezzp1 is not None and len(Ezzp1) == n:
+            return onp.asarray(Ezzp1).sum(axis=1)          # P(z_{t+1}) from the pairwise marginals
+        return onp.asarray(Ez)[:n]                           # initialize(): one-hot pseudo-expectations
+
+    def _legacy_m_step(self, expectations, datas):
+        datas = np.array(datas)[:, :-1]
         x = np.concatenate(datas)
         weights = np.concatenate([Ez for Ez, _, _ in expectations])
-
         for k in range(self.K):
-            # compute weighted histogram of the class assignments
-            xoh = one_hot(x, self.C) 
-
-            # Create a transition count matrix for dimension d under state k
             transition_matrix = np.zeros((self.C, self.C))
-
-            # Iterate through all possible transitions in the data
-            for t in range(1, len(xoh)):  # start from 1 because we need t-1
+            for t in range(1, len(x)):
                 transition_matrix[x[t-1], x[t]] += weights[t-1, k]
-
-            # Smoothing and normalization to prevent division by zero and to handle unobserved transitions
-            # print(transition_matrix)
             transition_matrix += 1e-5
             transition_matrix /= transition_matrix.sum(axis=-1, keepdims=True)
-
-            # Logarithm of transition probabilities
             self.logits[k] = np.log(transition_matrix)[np.newaxis, :, :]
+
+    def m_step(self, expectations, datas, inputs, masks, tags, **kwargs):
+        if self.legacy_mstep:
+            return self._legacy_m_step(expectations, datas)
+        counts = onp.zeros((self.K, self.D, self.C, self.C))
+        for (Ez, Ezzp1, _), data in zip(expectations, datas):
+            x = onp.asarray(data)[:, :self.D].astype(int)
+            n = len(x) - 1
+            if n < 1:
+                continue
+            w = self.emission_weights(Ez, Ezzp1, n)
+            for d in range(self.D):
+                for k in range(self.K):
+                    onp.add.at(counts[k, d], (x[:-1, d], x[1:, d]), w[:, k])
+        counts += 1e-5
+        counts /= counts.sum(axis=-1, keepdims=True)
+        self.logits = onp.log(counts)
     
     @ensure_args_are_lists
     def initialize(self, datas, inputs=None, masks=None, tags=None, init_method="random"):
@@ -718,6 +735,80 @@ class ARCategoricalObservations(Observations):
         """
         raise NotImplementedError
     
+
+
+class _KinRows(object):
+    """(1, n) step / turn arrays in the KinFeatures interface expected by kinematic emission models."""
+    def __init__(self, step, turn):
+        self.step = onp.asarray(step, dtype=float)[None]
+        self.turn = onp.asarray(turn, dtype=float)[None]
+
+    @property
+    def shape(self):
+        return self.step.shape
+
+
+class ARCategoricalKinematicObservations(ARCategoricalObservations):
+    """
+    ARCategoricalObservations plus per-state kinematic emissions of each move (step length / speed and
+    turning angle), e.g. naturenet.models.irl.kinematics.KinematicEmissions.
+
+    data rows: [state, step_feature, turn] (float array, T x 3): row t holds the discrete state x_t and the
+    kinematics of the move x_t -> x_{t+1} (NaN = missing; last row unused). The log-likelihood of move t is
+    log p(x_{t+1} | x_t, z) + kin_model.loglik(step_t, turn_t)[z].
+
+    kin_model (duck-typed): .K, .loglik(kin) -> (1, n, K), .m_step(gamma (1, n, K), kin), optional
+    .permute(perm); kin has .step / .turn (1, n) and .shape.
+    """
+    def __init__(self, K, D, M=0, C=2, kin_model=None):
+        super(ARCategoricalKinematicObservations, self).__init__(K, D, M, C)
+        if D != 1:
+            raise ValueError("ARCategoricalKinematicObservations supports D = 1 (one discrete state column)")
+        if kin_model is None or kin_model.K != K:
+            raise ValueError("kin_model with K = %d states is required" % K)
+        self.kin_model = kin_model
+
+    def _split(self, data):
+        data = onp.asarray(data, dtype=float)
+        if data.ndim != 2 or data.shape[1] < 3:
+            raise ValueError("data must be (T, 3) = [state, step, turn]")
+        return data[:, :1].astype(int), data[:-1, 1], data[:-1, 2]
+
+    def log_likelihoods(self, data, input, mask, tag):
+        x, step, turn = self._split(data)
+        m = None if mask is None else onp.asarray(mask)[:, :1]
+        ll = super(ARCategoricalKinematicObservations, self).log_likelihoods(x, input, m, tag)
+        return ll + self.kin_model.loglik(_KinRows(step, turn))[0]
+
+    def m_step(self, expectations, datas, inputs, masks, tags, **kwargs):
+        xs, steps, turns, ws = [], [], [], []
+        for (Ez, Ezzp1, _), data in zip(expectations, datas):
+            x, step, turn = self._split(data)
+            xs.append(x)
+            if len(step):
+                steps.append(step)
+                turns.append(turn)
+                ws.append(self.emission_weights(Ez, Ezzp1, len(step)))
+        super(ARCategoricalKinematicObservations, self).m_step(expectations, xs, inputs, masks, tags, **kwargs)
+        if ws:
+            self.kin_model.m_step(onp.concatenate(ws)[None],
+                                  _KinRows(onp.concatenate(steps), onp.concatenate(turns)))
+
+    def permute(self, perm):
+        super(ARCategoricalKinematicObservations, self).permute(perm)
+        if hasattr(self.kin_model, "permute"):
+            self.kin_model.permute(perm)
+
+    def sample_x(self, z, xhist, input=None, tag=None, with_noise=True):
+        xh = xhist[:, :1] if len(xhist) else xhist
+        x = super(ARCategoricalKinematicObservations, self).sample_x(z, xh, input, tag, with_noise)
+        return onp.array([x[0], onp.nan, onp.nan])
+
+    @ensure_args_are_lists
+    def initialize(self, datas, inputs=None, masks=None, tags=None, init_method="random"):
+        Ts = [data.shape[0] - 1 for data in datas]
+        zs = [npr.choice(self.K, size=T) for T in Ts]
+        self.m_step([(one_hot(z, self.K), None, None) for z in zs], datas, inputs, masks, tags)
 
 
 class InputDrivenObservations(Observations):

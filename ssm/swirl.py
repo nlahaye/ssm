@@ -41,6 +41,7 @@ class HMMs(object):
             stationary=trans.StationaryTransitions,
             recurrent=trans.RecurrentTransitions,
             mlprecurrent=trans.MLPRecurrentTransitions,
+            coupled_mlprecurrent=trans.CoupledMLPRecurrentTransitions,
             recurrent_only=trans.RecurrentOnlyTransitions,
             )
 
@@ -233,7 +234,8 @@ class ARHMMs(object):
             stationary=trans.StationaryTransitions,
             recurrent=trans.RecurrentTransitions,
             recurrent_only=trans.RecurrentOnlyTransitions,
-            mlprecurrent=trans.MLPRecurrentTransitions
+            mlprecurrent=trans.MLPRecurrentTransitions,
+            coupled_mlprecurrent=trans.CoupledMLPRecurrentTransitions,
             )
 
         if isinstance(transitions, str):
@@ -252,6 +254,7 @@ class ARHMMs(object):
         dynamics_classes = dict(
             none=obs.GaussianObservations,
             arcategorical=obs.ARCategoricalObservations,
+            arcategorical_kinematic=obs.ARCategoricalKinematicObservations,
             categorical=obs.CategoricalObservations,
             )
 
