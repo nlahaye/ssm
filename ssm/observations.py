@@ -666,6 +666,21 @@ class ARCategoricalObservations(Observations):
     # with P(z_{t-1}) instead of the posterior of the state that emits it (P(z_t) in ssm's ARHMM indexing).
     legacy_mstep = False
 
+    # Dirichlet pseudo-count added to every (z, x, x') transition count in the M-step (was a fixed 1e-5).
+    # pseudo_support: optional (C, C) bool mask of allowed x -> x' moves (e.g. reachable under the transition
+    # tensor T); allowed cells get pseudo_count, the rest pseudo_floor. None = pseudo_count everywhere.
+    # Set as class attributes (run_arhmm_kfold: arhmm_pseudo_count / arhmm_pseudo_support / arhmm_pseudo_floor).
+    pseudo_count = 1e-5
+    pseudo_support = None
+    pseudo_floor = 1e-5
+
+    def _pseudo(self):
+        if self.pseudo_support is None:
+            return self.pseudo_count
+        sup = onp.asarray(self.pseudo_support, dtype=bool)
+        assert sup.shape == (self.C, self.C), "pseudo_support must be (C, C)"
+        return onp.where(sup, self.pseudo_count, self.pseudo_floor)[None, None]
+
     @staticmethod
     def emission_weights(Ez, Ezzp1, n):
         """(n, K) posteriors of the latent emitting log-likelihood rows 0..n-1 (= moves x_t -> x_{t+1})."""
@@ -681,7 +696,8 @@ class ARCategoricalObservations(Observations):
             transition_matrix = np.zeros((self.C, self.C))
             for t in range(1, len(x)):
                 transition_matrix[x[t-1], x[t]] += weights[t-1, k]
-            transition_matrix += 1e-5
+            transition_matrix += onp.asarray(self._pseudo()).reshape(-1, self.C, self.C)[0] \
+                if self.pseudo_support is not None else self.pseudo_count
             transition_matrix /= transition_matrix.sum(axis=-1, keepdims=True)
             self.logits[k] = np.log(transition_matrix)[np.newaxis, :, :]
 
@@ -698,7 +714,7 @@ class ARCategoricalObservations(Observations):
             for d in range(self.D):
                 for k in range(self.K):
                     onp.add.at(counts[k, d], (x[:-1, d], x[1:, d]), w[:, k])
-        counts += 1e-5
+        counts += self._pseudo()
         counts /= counts.sum(axis=-1, keepdims=True)
         self.logits = onp.log(counts)
     
