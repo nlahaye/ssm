@@ -1,0 +1,5 @@
+[build-system]
+# Build the Cython extension (ssm.cstats) against NumPy 2: extensions compiled with NumPy 2 also run on
+# NumPy 1.x (>=1.25 ABI), while ones compiled with NumPy 1.x fail to import under NumPy 2.
+requires = ["setuptools>=61", "wheel", "cython>=3.0", "numpy>=2.0"]
+build-backend = "setuptools.build_meta"
