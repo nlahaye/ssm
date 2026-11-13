@@ -649,9 +649,37 @@ class ARCategoricalObservations(Observations):
     def permute(self, perm):
         self.logits = self.logits[perm]
 
+    # True: gather log P(x_{t+1} | x_t, z) directly instead of the one-hot einsum of stats.arcategorical_logpdf
+    # (same values; O(T K D) instead of O(T K D C^2) per sequence). False restores the original call.
+    fast_loglik = True
+
     def log_likelihoods(self, data, input, mask, tag):
         mask = np.ones_like(data, dtype=bool) if mask is None else mask
-        return stats.arcategorical_logpdf(data[:, None, :], self.logits, mask=mask[:, None, :])
+        if not self.fast_loglik:
+            return stats.arcategorical_logpdf(data[:, None, :], self.logits, mask=mask[:, None, :])
+        assert data.dtype in (int, onp.int8, onp.int16, onp.int32, onp.int64)
+        assert onp.all((data >= 0) & (data < self.C))
+        D = data.shape[1]
+        logits = self._normed_logits()                                           # (K, D, C, C)
+        d = onp.arange(D)[None, :]
+        vals = logits[:, d, data[:-1], data[1:]]                                  # (K, T-1, D)
+        return np.sum(vals * mask[1:][None], axis=-1).T                          # (T-1, K)
+
+    def _normed_logits(self):
+        """log-normalised logits, cached while self.logits is the same (non-autograd) array."""
+        L = self.logits
+        if not isinstance(L, onp.ndarray):          # autograd box: no caching
+            return L - logsumexp(L, axis=-1, keepdims=True)
+        c = getattr(self, "_norm_cache", None)
+        if c is None or c[0] is not L:
+            c = (L, L - logsumexp(L, axis=-1, keepdims=True))
+            self._norm_cache = c
+        return c[1]
+
+    def __getstate__(self):
+        st = self.__dict__.copy()
+        st.pop("_norm_cache", None)
+        return st
 
     def sample_x(self, z, xhist, input=None, tag=None, with_noise=True):
         if len(xhist) < 1:
@@ -700,6 +728,7 @@ class ARCategoricalObservations(Observations):
                 if self.pseudo_support is not None else self.pseudo_count
             transition_matrix /= transition_matrix.sum(axis=-1, keepdims=True)
             self.logits[k] = np.log(transition_matrix)[np.newaxis, :, :]
+        self._norm_cache = None
 
     def m_step(self, expectations, datas, inputs, masks, tags, **kwargs):
         if self.legacy_mstep:

@@ -1,4 +1,6 @@
 from functools import partial
+
+import numpy
 from warnings import warn
 
 import autograd.numpy as np
@@ -292,8 +294,32 @@ class RecurrentTransitions(Transitions):
         super(RecurrentTransitions, self).permute(perm)
         self.Rs = self.Rs[perm]
 
+    # True: look up the (C, K, K) table (cached while the parameters are unchanged numpy arrays) instead of
+    # running the MLP on each sequence's one-hot states; same values. Autograd boxes use the original path.
+    table_lookup = True
+
+    def _cached_table(self):
+        ps = self.params[:5]
+        if not all(isinstance(p, numpy.ndarray) for p in ps):
+            return None
+        c = getattr(self, "_table_cache", None)
+        if c is None or any(a is not b for a, b in zip(c[0], ps)):
+            c = (ps, self._log_transition_table(ps))
+            self._table_cache = c
+        return c[1]
+
+    def __getstate__(self):
+        st = self.__dict__.copy()
+        st.pop("_table_cache", None)
+        return st
+
     def log_transition_matrices(self, data, input, mask, tag):
         T, _ = data.shape
+        tab = self._cached_table() if self.table_lookup else None
+        if tab is not None:
+            x = numpy.asarray(data[:-1, 0]).astype(int)
+            assert numpy.all(x >= 0) and numpy.all(x < self.C)
+            return tab[x]
         # Previous state effect
         log_Ps = np.tile(self.log_Ps[None, :, :], (T-1, 1, 1))
         # Input effect
@@ -402,8 +428,32 @@ class MLPRecurrentTransitions(Transitions):
     def sigmoid(self, x):
         return 1 / (1 + np.exp(-x))
 
+    # True: look up the (C, K, K) table (cached while the parameters are unchanged numpy arrays) instead of
+    # running the MLP on each sequence's one-hot states; same values. Autograd boxes use the original path.
+    table_lookup = True
+
+    def _cached_table(self):
+        ps = self.params[:5]
+        if not all(isinstance(p, numpy.ndarray) for p in ps):
+            return None
+        c = getattr(self, "_table_cache", None)
+        if c is None or any(a is not b for a, b in zip(c[0], ps)):
+            c = (ps, self._log_transition_table(ps))
+            self._table_cache = c
+        return c[1]
+
+    def __getstate__(self):
+        st = self.__dict__.copy()
+        st.pop("_table_cache", None)
+        return st
+
     def log_transition_matrices(self, data, input, mask, tag):
         T, _ = data.shape
+        tab = self._cached_table() if self.table_lookup else None
+        if tab is not None:
+            x = numpy.asarray(data[:-1, 0]).astype(int)
+            assert numpy.all(x >= 0) and numpy.all(x < self.C)
+            return tab[x]
         # Previous state effect
         log_Ps = np.tile(self.log_Ps[None, :, :], (T-1, 1, 1))
         # Input effect
@@ -421,8 +471,49 @@ class MLPRecurrentTransitions(Transitions):
         log_Ps = log_Ps + Z2[:, None, :]
         return log_Ps - logsumexp(log_Ps, axis=2, keepdims=True)
 
-    def m_step(self, expectations, datas, inputs, masks, tags, **kwargs):
-        Transitions.m_step(self, expectations, datas, inputs, masks, tags, **kwargs)
+    # The MLP input is the one-hot previous state, so the expected log joint depends on the data only through
+    # N[c, i, j] = sum_{n, t: x_t = c} E[z_t = i, z_{t+1} = j]. suff_stat_mstep evaluates the SAME objective
+    # (and gradient) from these (C, K, K) counts instead of looping over sequences under autograd, so the
+    # cost of an L-BFGS step no longer grows with the number of sequences. Set False for the original path.
+    suff_stat_mstep = True
+
+    def _suff_stats(self, expectations, datas):
+        K, C = self.K, self.C
+        N = numpy.zeros((C, K, K))
+        for data, (_, Ezzp1, _) in zip(datas, expectations):
+            if data.shape[0] < 2:
+                continue
+            x = numpy.asarray(data[:-1, 0]).astype(int)
+            if x.min() < 0 or x.max() >= C:
+                raise ValueError("MLPRecurrentTransitions: state values must lie in [0, C)")
+            numpy.add.at(N, x, numpy.asarray(Ezzp1))
+        return N
+
+    def _log_transition_table(self, params=None):
+        """(C, K, K): log P(z_{t+1} = j | z_t = i, x_t = c) for every state c (one row per one-hot input)."""
+        log_Ps, W1, b1, W2, b2 = self.params[:5] if params is None else params[:5]
+        A1 = self.sigmoid(W1 + b1)                       # one_hot(c) @ W1 = W1[c]
+        Z2 = np.dot(A1, W2) + b2                         # (C, K)
+        L = log_Ps[None, :, :] + Z2[:, None, :]
+        return L - logsumexp(L, axis=2, keepdims=True)
+
+    def m_step(self, expectations, datas, inputs, masks, tags,
+               optimizer="lbfgs", num_iters=1000, **kwargs):
+        if not self.suff_stat_mstep:
+            return Transitions.m_step(self, expectations, datas, inputs, masks, tags,
+                                      optimizer=optimizer, num_iters=num_iters, **kwargs)
+        optimizer = dict(sgd=sgd, adam=adam, rmsprop=rmsprop, bfgs=bfgs, lbfgs=lbfgs)[optimizer]
+        N = self._suff_stats(expectations, datas)
+        T = sum([data.shape[0] for data in datas])
+
+        def _objective(params, itr):
+            self.params = params
+            return -(self.log_prior() + np.sum(N * self._log_transition_table())) / T
+
+        optimizer_state = self.optimizer_state if hasattr(self, "optimizer_state") else None
+        self.params, self.optimizer_state = \
+            optimizer(_objective, self.params, num_iters=num_iters,
+                      state=optimizer_state, full_output=True, **kwargs)
 
 
 class CoupledMLPRecurrentTransitions(MLPRecurrentTransitions):
@@ -438,6 +529,8 @@ class CoupledMLPRecurrentTransitions(MLPRecurrentTransitions):
     `inputs` rows are aligned with data rows. alpha = sigmoid(alpha_raw) is fitted with the other parameters
     by the generic Transitions.m_step (autograd). alpha = 0 or w = 0 is exactly MLPRecurrentTransitions.
     """
+    suff_stat_mstep = False   # transitions depend on the partner inputs: generic per-sequence objective
+
     def __init__(self, K, D, M=0, C=10, alpha0=0.1, fit_alpha=True):
         if M != K + 1:
             raise ValueError("CoupledMLPRecurrentTransitions needs M = K + 1 inputs [w, c_0..c_{K-1}]; got M=%d, K=%d" % (M, K))
@@ -460,6 +553,42 @@ class CoupledMLPRecurrentTransitions(MLPRecurrentTransitions):
         self.log_Ps, self.W1, self.b1, self.W2, self.b2 = value[:5]
         if self.fit_alpha:
             self.alpha_raw = value[5]
+
+    # True: evaluate the generic expected log joint once over all rows stacked (the MLP part via the (C, K, K)
+    # table) instead of a Python loop over sequences under autograd. Same objective. False = original loop.
+    stacked_mstep = True
+
+    def m_step(self, expectations, datas, inputs, masks, tags,
+               optimizer="lbfgs", num_iters=1000, **kwargs):
+        ok = self.stacked_mstep and all(i is not None and i.shape[1] == self.K + 1 for i in inputs)
+        if not ok:
+            return Transitions.m_step(self, expectations, datas, inputs, masks, tags,
+                                      optimizer=optimizer, num_iters=num_iters, **kwargs)
+        optimizer = dict(sgd=sgd, adam=adam, rmsprop=rmsprop, bfgs=bfgs, lbfgs=lbfgs)[optimizer]
+        X, U, E = [], [], []
+        for data, input, (_, Ezzp1, _) in zip(datas, inputs, expectations):
+            if data.shape[0] < 2:
+                continue
+            X.append(numpy.asarray(data[:-1, 0]).astype(int))
+            U.append(numpy.asarray(input[1:], dtype=float))
+            E.append(numpy.asarray(Ezzp1))
+        T = sum([data.shape[0] for data in datas])
+        if not X:
+            return
+        X, U, E = numpy.concatenate(X), numpy.concatenate(U), numpy.concatenate(E)
+        w, c = U[:, 0][:, None, None], U[:, 1:][:, None, :]
+
+        def _objective(params, itr):
+            self.params = params
+            log_P0 = self._log_transition_table()[X]                  # (n, K, K)
+            aw = self.alpha * w
+            P = (1 - aw) * np.exp(log_P0) + aw * c
+            return -(self.log_prior() + np.sum(E * np.log(np.clip(P, 1e-300, 1.0)))) / T
+
+        optimizer_state = self.optimizer_state if hasattr(self, "optimizer_state") else None
+        self.params, self.optimizer_state = \
+            optimizer(_objective, self.params, num_iters=num_iters,
+                      state=optimizer_state, full_output=True, **kwargs)
 
     def log_transition_matrices(self, data, input, mask, tag):
         log_P0 = super(CoupledMLPRecurrentTransitions, self).log_transition_matrices(data, input, mask, tag)

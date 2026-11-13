@@ -933,47 +933,51 @@ class ARHMM(object):
 
         pbar = ssm_pbar(num_iters, verbose, "LP: {:.1f}", [lls[-1]])
 
-        n_itr = 0
-        for itr in pbar:
-            n_itr += 1
-            print('iter ', n_itr)
-            # E step: compute expected latent states with current parameters
-            expectations = [self.expected_states(data, input, mask, tag)
-                            for data, input, mask, tag,
-                            in zip(datas, inputs, masks, tags)]
+        from ssm.parallel import EStepPool
+        estep = EStepPool(self, datas, inputs, masks, tags)   # serial unless estep_n_jobs / SSM_ESTEP_JOBS > 1
+        try:
+            n_itr = 0
+            for itr in pbar:
+                n_itr += 1
+                print('iter ', n_itr)
+                # E step: compute expected latent states with current parameters (optionally across processes)
+                expectations = estep.expectations(self, datas, inputs, masks, tags)
             
-            # print(expectations[0][0])
-            # print('fit em finish')
+                # print(expectations[0][0])
+                # print('fit em finish')
 
-            # M step: maximize expected log joint wrt parameters
-            # print('before m step')
-            # print(self.init_state_distn.initial_state_distn)
-            # print(self.transitions.transition_matrices(np.arange(26)[:, None], None, None, None))
-            # # from scipy.special import logsumexp
-            # ps = np.exp(self.observations.logits - logsumexp(self.observations.logits, axis=-1, keepdims=True))
-            # print(ps)
-            self.init_state_distn.m_step(expectations, datas, inputs, masks, tags, **init_state_mstep_kwargs)
-            self.transitions.m_step(expectations, datas, inputs, masks, tags, **transitions_mstep_kwargs)
-            self.observations.m_step(expectations, datas, inputs, masks, tags, **observations_mstep_kwargs)
+                # M step: maximize expected log joint wrt parameters
+                # print('before m step')
+                # print(self.init_state_distn.initial_state_distn)
+                # print(self.transitions.transition_matrices(np.arange(26)[:, None], None, None, None))
+                # # from scipy.special import logsumexp
+                # ps = np.exp(self.observations.logits - logsumexp(self.observations.logits, axis=-1, keepdims=True))
+                # print(ps)
+                self.init_state_distn.m_step(expectations, datas, inputs, masks, tags, **init_state_mstep_kwargs)
+                self.transitions.m_step(expectations, datas, inputs, masks, tags, **transitions_mstep_kwargs)
+                self.observations.m_step(expectations, datas, inputs, masks, tags, **observations_mstep_kwargs)
 
-            # print('after m step')
-            # print(self.init_state_distn.initial_state_distn)
-            # print(self.transitions.transition_matrices(np.arange(26)[:, None], None, None, None))
-            # ps = np.exp(self.observations.logits - logsumexp(self.observations.logits, axis=-1, keepdims=True))
-            # print(ps)
+                # print('after m step')
+                # print(self.init_state_distn.initial_state_distn)
+                # print(self.transitions.transition_matrices(np.arange(26)[:, None], None, None, None))
+                # ps = np.exp(self.observations.logits - logsumexp(self.observations.logits, axis=-1, keepdims=True))
+                # print(ps)
 
-            # Store progress
-            # lls.append(self.log_prior() + sum([ll for (_, _, ll) in expectations]))
-            lls.append(sum([ll for (_, _, ll) in expectations]))
+                # Store progress
+                # lls.append(self.log_prior() + sum([ll for (_, _, ll) in expectations]))
+                lls.append(sum([ll for (_, _, ll) in expectations]))
 
-            if verbose == 2:
-              pbar.set_description("LP: {:.1f}".format(lls[-1]))
-
-            # Check for convergence
-            if itr > 0 and abs(lls[-1] - lls[-2]) < tolerance:
                 if verbose == 2:
-                  pbar.set_description("Converged to LP: {:.1f}".format(lls[-1]))
-                break
+                  pbar.set_description("LP: {:.1f}".format(lls[-1]))
+
+                # Check for convergence
+                if itr > 0 and abs(lls[-1] - lls[-2]) < tolerance:
+                    if verbose == 2:
+                      pbar.set_description("Converged to LP: {:.1f}".format(lls[-1]))
+                    break
+
+        finally:
+            estep.close()
 
         return lls
 

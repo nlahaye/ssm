@@ -341,7 +341,9 @@ class ARHMMs(object):
                    num_init_iters=50,
                    Ronly=False,
                    discrete_state_init_method="random",
-                   num_init_restarts=1):
+                   num_init_restarts=1,
+                   tolerance=0):
+        # tolerance > 0: stop EM when the log-probability changes by less than this (default 0 = all iterations)
         # First initialize the observation model
         # self.emissions.initialize(datas, inputs, masks, tags)
 
@@ -375,6 +377,7 @@ class ARHMMs(object):
                       verbose=verbose,
                       method="emR",
                       num_iters=num_init_iters,
+                      tolerance=tolerance,
                       initialize=False,
                       init_method=discrete_state_init_method)
             else:
@@ -382,6 +385,7 @@ class ARHMMs(object):
                       verbose=verbose,
                       method="em",
                       num_iters=num_init_iters,
+                      tolerance=tolerance,
                       initialize=False,
                       init_method=discrete_state_init_method)
 
